@@ -21,25 +21,19 @@ from datetime import datetime
 
 # Global variables for callback-based IMU collection
 imu_data_queue = queue.Queue()  # Thread-safe queue for IMU data
-imu_lock = threading.Lock()
 imu_sample_count = 0
 
-# Separate CSV writers for accel and gyro (will be set in main function)
-accel_csv_writer = None
-gyro_csv_writer = None
-
-def save_depth(z, path):
+def save_depth_png(depth_m, path):
     '''
-    Saves a depth map to a 16-bit PNG file
+    Saves a depth map as 16-bit PNG in millimeters
     Args:
-        z : numpy[float32]
-            depth map
+        depth_m : numpy[float32/64]
+            depth map in meters
         path : str
-            path to store depth map
+            path to store depth PNG
     '''
-    z = np.uint32(z * 256.0)
-    z = Image.fromarray(z, mode='I')
-    z.save(path)
+    depth_mm_u16 = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+    Image.fromarray(depth_mm_u16, mode='I;16').save(path)
 
 def save_raw_depth(z, path):
     '''
@@ -47,55 +41,37 @@ def save_raw_depth(z, path):
     '''
     np.save(path, z)
 
-def accel_callback(frame):
+def motion_callback(frame):
     """
-    Callback function for accelerometer data
-    Called automatically by RealSense SDK when new accel data arrives (200Hz)
+    Unified callback for motion data (both accel and gyro)
+    Called automatically by RealSense SDK when new IMU data arrives (200Hz)
     """
-    global accel_csv_writer, imu_sample_count, imu_lock
+    global imu_sample_count
 
     try:
-        with imu_lock:
-            motion_data = frame.as_motion_frame().get_motion_data()
-            timestamp = frame.get_timestamp()  # Device timestamp in milliseconds
+        stream_type = frame.get_profile().stream_type()
+        motion_data = frame.as_motion_frame().get_motion_data()
+        timestamp = frame.get_timestamp()  # Device timestamp in milliseconds
 
-            # Store in queue with type marker
-            imu_data_queue.put({
-                'type': 'accel',
-                'timestamp': timestamp,
-                'x': motion_data.x,
-                'y': motion_data.y,
-                'z': motion_data.z
-            })
-            imu_sample_count += 1
+        item = {
+            'timestamp': timestamp,
+            'x': motion_data.x,
+            'y': motion_data.y,
+            'z': motion_data.z
+        }
 
-    except Exception as e:
-        print(f"Accel callback error: {e}")
+        if stream_type == rs.stream.accel:
+            item['type'] = 'accel'
+        elif stream_type == rs.stream.gyro:
+            item['type'] = 'gyro'
+        else:
+            return
 
-def gyro_callback(frame):
-    """
-    Callback function for gyroscope data
-    Called automatically by RealSense SDK when new gyro data arrives (200Hz)
-    """
-    global gyro_csv_writer, imu_sample_count, imu_lock
-
-    try:
-        with imu_lock:
-            motion_data = frame.as_motion_frame().get_motion_data()
-            timestamp = frame.get_timestamp()  # Device timestamp in milliseconds
-
-            # Store in queue with type marker
-            imu_data_queue.put({
-                'type': 'gyro',
-                'timestamp': timestamp,
-                'x': motion_data.x,
-                'y': motion_data.y,
-                'z': motion_data.z
-            })
-            imu_sample_count += 1
+        imu_data_queue.put(item)  # queue.Queue is thread-safe, no lock needed
+        imu_sample_count += 1
 
     except Exception as e:
-        print(f"Gyro callback error: {e}")
+        print(f"Motion callback error: {e}")
 
 def process_imu_queue_to_csv(accel_writer, gyro_writer):
     """
@@ -129,7 +105,6 @@ def process_imu_queue_to_csv(accel_writer, gyro_writer):
     return items_written
 
 def process_realsense_with_callback(dst_dirpath):
-    global accel_csv_writer, gyro_csv_writer
 
     # Create a pipeline
     pipeline = rs.pipeline()
@@ -139,8 +114,7 @@ def process_realsense_with_callback(dst_dirpath):
 
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
     config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 30)
-    config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 200)
-    config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+    # IMU streams are managed separately via motion_sensor.start(callback)
 
     # Create the directories
     if not os.path.exists(dst_dirpath):
@@ -171,6 +145,11 @@ def process_realsense_with_callback(dst_dirpath):
     accel_csv_writer.writerow(['timestamp_ms', 'accel_x', 'accel_y', 'accel_z'])
     gyro_csv_writer.writerow(['timestamp_ms', 'gyro_x', 'gyro_y', 'gyro_z'])
 
+    # Open frames index CSV to tie color/depth with timestamps
+    frames_csv_file = open(os.path.join(dst_dirpath, 'frames.csv'), 'w', newline='')
+    frames_csv_writer = csv.writer(frames_csv_file)
+    frames_csv_writer.writerow(['device_ts_ms', 'wallclock_iso', 'color_path', 'depth_png_path', 'depth_npy_path'])
+
     # Start pipeline
     profile = pipeline.start(config)
 
@@ -193,35 +172,42 @@ def process_realsense_with_callback(dst_dirpath):
     intrinsics_path = os.path.join(data_dirpath, 'intrinsics.npy')
     np.save(intrinsics_path, intrinsics_matrix)
 
+    # Write intrinsics path once (not every frame)
+    intrinsics_txt_file.write(intrinsics_path + '\n')
+
     # Create align object
     align = rs.align(rs.stream.color)
 
-    # Register callbacks for IMU sensors
+    # Register callback for motion sensor (single sensor for both accel and gyro)
     device = profile.get_device()
 
-    accel_sensor = None
-    gyro_sensor = None
+    motion_sensor = None
+    accel_profile = None
+    gyro_profile = None
 
     for sensor in device.query_sensors():
         if sensor.is_motion_sensor():
+            motion_sensor = sensor
             for profile_item in sensor.get_stream_profiles():
-                if profile_item.stream_type() == rs.stream.accel:
-                    accel_sensor = sensor
-                elif profile_item.stream_type() == rs.stream.gyro:
-                    gyro_sensor = sensor
+                stream_type = profile_item.stream_type()
+                if stream_type == rs.stream.accel and accel_profile is None:
+                    accel_profile = profile_item
+                elif stream_type == rs.stream.gyro and gyro_profile is None:
+                    gyro_profile = profile_item
 
-    if accel_sensor is None or gyro_sensor is None:
-        print("ERROR: Could not find IMU sensors!")
+    if motion_sensor is None or accel_profile is None or gyro_profile is None:
+        print("ERROR: Motion sensor or profiles not found!")
         pipeline.stop()
         return
 
-    accel_sensor.open(accel_sensor.get_stream_profiles()[0])
-    accel_sensor.start(accel_callback)
-
-    gyro_sensor.open(gyro_sensor.get_stream_profiles()[0])
-    gyro_sensor.start(gyro_callback)
+    # Open both profiles together on the SAME sensor
+    motion_sensor.open([accel_profile, gyro_profile])
+    motion_sensor.start(motion_callback)
 
     stream_idx = 0
+
+    # Create OpenCV window once (outside loop)
+    cv2.namedWindow('Stream', cv2.WINDOW_NORMAL)
 
     # Streaming loop
     try:
@@ -231,9 +217,6 @@ def process_realsense_with_callback(dst_dirpath):
         print(f"Gyroscope data: {os.path.join(dst_dirpath, 'gyroscope.csv')}\n")
 
         while True:
-            timestamp = datetime.now().isoformat(timespec='milliseconds')
-            filename = '{}.png'.format(timestamp)
-
             # Get frameset of color and depth
             frames = pipeline.wait_for_frames()
 
@@ -256,37 +239,56 @@ def process_realsense_with_callback(dst_dirpath):
             if not aligned_depth_frame or not color_frame:
                 continue
 
-            depth_image = np.asanyarray(aligned_depth_frame.get_data()) * depth_scale
+            # Get timestamps - use device timestamp for sync
+            device_ts = int(color_frame.get_timestamp())  # milliseconds
+            wallclock_ts = datetime.now().isoformat(timespec='milliseconds')
+
+            # Generate filenames from device timestamp
+            png_filename = f"{device_ts}.png"
+            npy_filename = f"{device_ts}.npy"
+
+            # Build paths
+            image_path = os.path.join(image_dirpath, png_filename)
+            depth_png_path = os.path.join(depth_dirpath, png_filename)
+            depth_npy_path = os.path.join(depth_npy_dirpath, npy_filename)
+
+            # Process depth: raw uint16 -> meters (float)
+            raw_z16 = np.asanyarray(aligned_depth_frame.get_data())
+            depth_m = raw_z16 * depth_scale
+
+            # Save color image
             color_image = np.asanyarray(color_frame.get_data())
+            Image.fromarray(color_image).save(image_path)
 
-            # Save to disk
-            image = Image.fromarray(color_image)
-            image_path = os.path.join(image_dirpath, filename)
-            image.save(image_path)
+            # Save depth as PNG (millimeters, uint16) and NPY (meters, float)
+            save_depth_png(depth_m, depth_png_path)
+            save_raw_depth(depth_m, depth_npy_path)
+
+            # Write to legacy text files
             image_txt_file.write(image_path + '\n')
+            depth_txt_file.write(depth_png_path + '\n')
 
-            depth_path = os.path.join(depth_dirpath, filename)
-            depth_npy_path = os.path.join(depth_npy_dirpath, filename)
-            save_depth(depth_image, depth_path)
-            save_raw_depth(depth_image, depth_npy_path)
-            depth_txt_file.write(depth_path + '\n')
+            # Write to frames index CSV
+            frames_csv_writer.writerow([device_ts, wallclock_ts, image_path, depth_png_path, depth_npy_path])
 
-            intrinsics_txt_file.write(intrinsics_path + '\n')
-
-            # Render images
+            # Render images for display
             color_image_bgr = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
-            depth_colormap = np.expand_dims(depth_image, -1)
-            depth_colormap = 255.0 * depth_colormap / np.max(depth_colormap)
-            depth_colormap = np.tile(depth_colormap, (1, 1, 3)).astype(np.uint8)
 
-            images = np.hstack((color_image_bgr, depth_colormap))
+            # Visualize depth with divide-by-zero protection
+            viz_depth = depth_m.copy()
+            max_depth = np.max(viz_depth)
+            if max_depth > 0:
+                viz_depth = (viz_depth / max_depth) * 255.0
+            viz_depth = np.tile(viz_depth[..., None], (1, 1, 3)).astype(np.uint8)
 
-            # Display status
+            images = np.hstack((color_image_bgr, viz_depth))
+
+            # Display status and periodic flush
             if stream_idx % 30 == 0:
                 queue_size = imu_data_queue.qsize()
                 print(f"Frame: {stream_idx} | IMU samples collected: {imu_sample_count} | Queue size: {queue_size}")
+                frames_csv_file.flush()  # Flush frames index periodically
 
-            cv2.namedWindow('Stream', cv2.WINDOW_NORMAL)
             cv2.imshow('Stream', images)
             key = cv2.waitKey(1)
 
@@ -297,17 +299,14 @@ def process_realsense_with_callback(dst_dirpath):
             stream_idx += 1
 
     finally:
-        # Process remaining IMU data
+        # Stop motion sensor FIRST to prevent race condition
+        if motion_sensor:
+            motion_sensor.stop()
+            motion_sensor.close()
+
+        # NOW safely drain remaining IMU data from queue
         print("\nProcessing remaining IMU data...")
         process_imu_queue_to_csv(accel_csv_writer, gyro_csv_writer)
-
-        # Stop IMU sensors
-        if accel_sensor:
-            accel_sensor.stop()
-            accel_sensor.close()
-        if gyro_sensor:
-            gyro_sensor.stop()
-            gyro_sensor.close()
 
         # Stop pipeline
         pipeline.stop()
@@ -318,6 +317,7 @@ def process_realsense_with_callback(dst_dirpath):
         intrinsics_txt_file.close()
         accel_csv_file.close()
         gyro_csv_file.close()
+        frames_csv_file.close()
 
         print(f"\n{'='*60}")
         print(f"Data collection complete!")
@@ -326,10 +326,13 @@ def process_realsense_with_callback(dst_dirpath):
         print(f"Total IMU samples collected: {imu_sample_count}")
         print(f"Expected IMU samples (200Hz): ~{stream_idx * 200 // 30}")
         print(f"\nOutput files:")
+        print(f"  - Frames index: {os.path.join(dst_dirpath, 'frames.csv')}")
         print(f"  - Accelerometer: {os.path.join(dst_dirpath, 'accelerometer.csv')}")
         print(f"  - Gyroscope: {os.path.join(dst_dirpath, 'gyroscope.csv')}")
         print(f"  - Images: {image_dirpath}")
-        print(f"  - Depth: {depth_dirpath}")
+        print(f"  - Depth PNG (mm): {depth_dirpath}")
+        print(f"  - Depth NPY (m): {depth_npy_dirpath}")
+        print(f"  - Intrinsics: {intrinsics_path}")
         print(f"{'='*60}\n")
 
 
