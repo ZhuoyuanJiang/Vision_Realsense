@@ -239,13 +239,13 @@ def process_realsense_with_callback(dst_dirpath):
             if not aligned_depth_frame or not color_frame:
                 continue
 
-            # Get timestamps - use device timestamp for sync
+            # Get timestamps - device timestamp for IMU sync, ISO for filenames
             device_ts = int(color_frame.get_timestamp())  # milliseconds
             wallclock_ts = datetime.now().isoformat(timespec='milliseconds')
 
-            # Generate filenames from device timestamp
-            png_filename = f"{device_ts}.png"
-            npy_filename = f"{device_ts}.npy"
+            # Generate filenames from ISO timestamp (like original)
+            png_filename = f"{wallclock_ts}.png"
+            npy_filename = f"{wallclock_ts}.npy"
 
             # Build paths
             image_path = os.path.join(image_dirpath, png_filename)

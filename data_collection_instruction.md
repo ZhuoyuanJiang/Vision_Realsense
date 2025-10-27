@@ -74,14 +74,14 @@ my_recording_session/
 └── data/
     ├── intrinsics.npy         # Camera intrinsics matrix (3×3)
     ├── image/                 # RGB color images (640×480)
-    │   ├── 12345678.png
-    │   ├── 12345711.png
+    │   ├── 2025-10-27T10:15:32.456.png
+    │   ├── 2025-10-27T10:15:32.489.png
     │   └── ...
     ├── depth/                 # Depth as PNG (640×480, uint16 millimeters)
-    │   ├── 12345678.png
+    │   ├── 2025-10-27T10:15:32.456.png
     │   └── ...
     └── depth_npy/             # Depth as NumPy (640×480, float32 meters)
-        ├── 12345678.npy
+        ├── 2025-10-27T10:15:32.456.npy
         └── ...
 ```
 
@@ -132,39 +132,39 @@ timestamp_ms,gyro_x,gyro_y,gyro_z
 
 ```csv
 device_ts_ms,wallclock_iso,color_path,depth_png_path,depth_npy_path
-12345678,2025-10-27T10:15:32.456,/path/to/data/image/12345678.png,/path/to/data/depth/12345678.png,/path/to/data/depth_npy/12345678.npy
-12345711,2025-10-27T10:15:32.489,/path/to/data/image/12345711.png,/path/to/data/depth/12345711.png,/path/to/data/depth_npy/12345711.npy
+176160346444,2025-10-27T10:15:32.456,/path/to/data/image/2025-10-27T10:15:32.456.png,/path/to/data/depth/2025-10-27T10:15:32.456.png,/path/to/data/depth_npy/2025-10-27T10:15:32.456.npy
+176160346477,2025-10-27T10:15:32.489,/path/to/data/image/2025-10-27T10:15:32.489.png,/path/to/data/depth/2025-10-27T10:15:32.489.png,/path/to/data/depth_npy/2025-10-27T10:15:32.489.npy
 ```
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `device_ts_ms` | int | Device timestamp (milliseconds), used as filename |
-| `wallclock_iso` | string | Wall-clock time in ISO 8601 format |
+| `device_ts_ms` | int | Device timestamp (milliseconds) for IMU synchronization |
+| `wallclock_iso` | string | Wall-clock time in ISO 8601 format, used as filename |
 | `color_path` | string | Absolute path to RGB image (PNG) |
 | `depth_png_path` | string | Absolute path to depth PNG (millimeters) |
 | `depth_npy_path` | string | Absolute path to depth NumPy (meters) |
 
-**Usage**: This file links color/depth frames and enables synchronization with IMU data via `device_ts_ms`.
+**Usage**: This file links color/depth frames and enables synchronization with IMU data via `device_ts_ms`. Filenames use `wallclock_iso` for human readability.
 
 ### 4. Color Images (`data/image/*.png`)
 
 **Resolution**: 640×480
 **Format**: PNG (24-bit RGB)
-**Naming**: Device timestamp in milliseconds (e.g., `12345678.png`)
+**Naming**: ISO 8601 timestamp (e.g., `2025-10-27T10:15:32.456.png`)
 
 ### 5. Depth Images - PNG (`data/depth/*.png`)
 
 **Resolution**: 640×480
 **Format**: PNG (16-bit grayscale, mode 'I;16')
 **Unit**: Millimeters (uint16)
-**Naming**: Device timestamp in milliseconds (e.g., `12345678.png`)
+**Naming**: ISO 8601 timestamp (e.g., `2025-10-27T10:15:32.456.png`)
 
 **To load in Python**:
 ```python
 from PIL import Image
 import numpy as np
 
-depth_mm = np.array(Image.open('12345678.png'))  # uint16 millimeters
+depth_mm = np.array(Image.open('2025-10-27T10:15:32.456.png'))  # uint16 millimeters
 depth_m = depth_mm / 1000.0  # Convert to meters
 ```
 
@@ -174,13 +174,13 @@ depth_m = depth_mm / 1000.0  # Convert to meters
 **Format**: NumPy binary (.npy)
 **Type**: float32 or float64
 **Unit**: Meters
-**Naming**: Device timestamp in milliseconds (e.g., `12345678.npy`)
+**Naming**: ISO 8601 timestamp (e.g., `2025-10-27T10:15:32.456.npy`)
 
 **To load in Python**:
 ```python
 import numpy as np
 
-depth_m = np.load('12345678.npy')  # Already in meters (float)
+depth_m = np.load('2025-10-27T10:15:32.456.npy')  # Already in meters (float)
 ```
 
 ### 7. Camera Intrinsics (`data/intrinsics.npy`)
@@ -240,8 +240,11 @@ ls -lh my_recording_session/data/image/ | head -5
 
 ## Synchronization Strategy
 
-### Device Timestamps
-All data uses **device timestamps** from the RealSense camera (in milliseconds). This ensures accurate synchronization between:
+### Dual Timestamp Approach
+- **Filenames**: Use ISO 8601 wall-clock timestamps for human readability (e.g., `2025-10-27T10:15:32.456.png`)
+- **Synchronization**: Use device timestamps from `frames.csv` for accurate sync with IMU data
+
+All IMU and frame data share the same **device timestamp** time base (in milliseconds from RealSense hardware). This ensures accurate synchronization between:
 - Color frames
 - Depth frames
 - Accelerometer readings
